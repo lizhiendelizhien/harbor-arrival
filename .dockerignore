@@ -1,0 +1,30 @@
+.git/
+.gitignore
+.gitattributes
+
+# Local data, checkpoints, and generated output
+data/
+sample_data/
+models/
+outputs/
+logs_rl/
+logs_eval/
+wandb/
+
+# Build and cache output
+build/
+dist/
+*.egg-info/
+.eggs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+docs/_build/
+
+# Local environments and editor files
+.venv*/
+.idea/
+.vscode/
+.DS_Store
