@@ -70,5 +70,13 @@ logs_eval/
 *.code-workspace
 tempCodeRunnerFile.py
 data/
-tests/
-docs/
+tests/*
+docs/*
+!tests/test_finance_observations.py
+!tests/test_finance_model.py
+!tests/test_finance_policy.py
+!tests/test_finance_environment.py
+!tests/test_finance_rewards.py
+!tests/test_finance_ppo.py
+!tests/test_finance_training_cli.py
+!docs/finance_sonic_design.md

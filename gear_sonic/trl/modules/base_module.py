@@ -3,7 +3,6 @@
 import inspect
 
 import torch.nn as nn
-import torchvision.models as models
 
 
 def get_norm(norm_type, dim):
@@ -477,6 +476,8 @@ class BaseModule(nn.Module):
                 ``"pretrained"`` (bool), and ``"trainable"`` (bool, freezes
                 backbone params when False).
         """
+        import torchvision.models as models
+
         print("Building ResNet layer")
         resnet_type = layer_config.get("resnet_type", "resnet18")  # Default to resnet18
         pretrained = layer_config.get("pretrained", True)

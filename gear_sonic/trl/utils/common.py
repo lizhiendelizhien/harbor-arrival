@@ -1,6 +1,5 @@
 """Miscellaneous training utilities: W&B helpers, dynamic imports, OmegaConf tools, and timers."""
 
-import wandb
 import importlib
 import os
 import time
@@ -8,6 +7,8 @@ from omegaconf import OmegaConf, DictConfig, ListConfig
 
 
 def wandb_run_exists():
+    import wandb
+
     return isinstance(wandb.run, wandb.sdk.wandb_run.Run)
 
 
