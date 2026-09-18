@@ -28,6 +28,7 @@ finance = [
     "vector-quantize-pytorch==1.31.4",
     "tensordict==0.14.1",
     "omegaconf>=2.3,<2.4",
+    "tensorboard",
 ]
 training = [
     "hydra-core==1.3.2",

@@ -79,4 +79,8 @@ docs/*
 !tests/test_finance_rewards.py
 !tests/test_finance_ppo.py
 !tests/test_finance_training_cli.py
+!tests/test_finance_evaluation.py
+!tests/test_finance_visualization.py
+!tests/test_finance_distributed.py
 !docs/finance_sonic_design.md
+docs/finance_sonic_design.md

@@ -76,6 +76,39 @@ def test_tiny_cli_trains_saves_and_restarts_without_world_heads(tmp_path, capsys
                        "--canonical", str(tmp_path / "missing.csv")])
 
 
+def test_tiny_cli_tensorboard_logs_and_resumes_steps(tmp_path, capsys):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    from scripts.train_finance_sonic import main
+
+    canonical = canonical_file(tmp_path)
+    output_dir = tmp_path / "tensorboard-run"
+    common = ["--canonical", str(canonical), "--symbols", "AAA", "BBB",
+              "--output-dir", str(output_dir), "--num-envs", "2", "--threads", "1",
+              "--tiny", "--sequence-length", "4", "--rollout-steps", "2",
+              "--epochs", "1", "--num-minibatches", "1", "--save-interval", "1",
+              "--logger", "tensorboard"]
+    assert main(common + ["--iterations", "1"]) == 0
+    checkpoint = output_dir / "checkpoint_000001.pt"
+    assert checkpoint.is_file()
+    assert main(common + ["--resume", str(checkpoint), "--iterations", "1"]) == 0
+
+    event_dir = output_dir / "tensorboard"
+    event_files = list(event_dir.glob("events.out.tfevents.*"))
+    assert event_files
+    accumulator = EventAccumulator(str(event_dir), size_guidance={"scalars": 0})
+    accumulator.Reload()
+    for tag in ("Loss/ppo_loss", "Reward/reward_total", "Tracking/monthly_mse",
+                "Tracking/direction_accuracy_10m"):
+        assert tag in accumulator.Tags()["scalars"]
+        assert [item.step for item in accumulator.Scalars(tag)] == [1, 2]
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    iteration_logs = [row for row in logs if row.get("event") == "iteration"]
+    assert [row["iteration"] for row in iteration_logs] == [1, 2]
+    event_value = accumulator.Scalars("Loss/ppo_loss")[0].value
+    assert event_value == pytest.approx(iteration_logs[0]["ppo_loss"])
+
+
 def test_cli_requires_explicit_iteration_budget_and_rejects_invalid_counts(tmp_path):
     from scripts.train_finance_sonic import main
 

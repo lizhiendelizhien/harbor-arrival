@@ -5,9 +5,10 @@
 This implements conditional future-trajectory reconstruction for one equity at
 each monthly anchor. It preserves the reference method's plain MLP encoder,
 shared continuous latent, FSQ auxiliary branch, and causal Transformer with a
-32-step KV cache. A single-process PPO runner trains low-level reference tracking
-with the retained Gaussian Actor and value Critic. There is no portfolio action,
-trading-profit reward, high-level policy, or causal latent predictor.
+32-step KV cache. The PPO runner trains low-level reference tracking with the
+retained Gaussian Actor and value Critic in either one process or synchronous
+multi-GPU data parallel mode. There is no portfolio action, trading-profit reward,
+high-level policy, or causal latent predictor.
 
 ```text
 future descriptors [B,S,10,15]
@@ -293,9 +294,11 @@ Reference sources are `gear_sonic/trl/trainer/ppo_trainer.py`,
 repository. The retained MLP, Transformer, Actor and Critic are reused. The
 financial playback environment, reward, observation scaling and critic fields
 are domain mappings. Semantic masking and clean-target denoising are ported with
-the financial groups and durations above. Physical disturbances, terrain/failure
-curricula, and distributed training are not ported. The runner
-rejects multi-rank execution; it is not a claim of full simulator/trainer parity.
+the financial groups and durations above. Physical disturbances and
+terrain/failure curricula are not applicable to the financial environment. The
+finance runner supports true multi-rank training through explicit reference/env
+shards, gradient all-reduce, and rank-zero checkpoint publication; this is not a
+claim of full simulator/trainer parity.
 
 ## Time Axes, Reference Pool, and Cache
 
@@ -346,6 +349,156 @@ environments rather than the reference experiment's 4096; `--num-envs` controls
 resource use. `--iterations` is required and counts additional updates on resume.
 No implicit date split is created. `--start`/`--end` narrow the reference pool;
 `--normalization` loads exported statistics instead of fitting the selected pool.
+
+For a true four-GPU run over the reconstructed trajectory archive:
+
+```bash
+TASK=finance_sonic_monthly \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NUM_GPUS=4 NUM_ENVS=1024 SEED=42 \
+FINANCE_MULTI_GPU_LAUNCHER=torchrun \
+bash scripts/train_finance_sonic_4gpu.sh
+```
+
+The launcher accepts either the archive root or its `trajectories/` child and
+resolves `trajectory_index.csv`, `metadata.pkl`, and `manifest.json` from the
+root. `NUM_ENVS` is per rank, matching the Sonic launcher convention, so the
+example runs 4096 environment streams globally. `torchrun` assigns one process
+to each visible device. Rank `r` owns the round-robin reference shard
+`sequences[r::world_size]` and independent environment RNG streams. Every PPO
+minibatch averages coalesced Actor, Critic, Kin, and Cycle gradients across all ranks;
+advantage moments, adaptive-KL input, Critic running statistics, and reported
+metrics are also pooled. Only rank 0 writes the immutable run recipe and the one
+checkpoint for each save step. The checkpoint's distributed metadata explicitly
+records `reference_sharding=round_robin` and `environment_sharding=per_rank`;
+`dataset_partition=none` still means no train/validation split.
+
+The account launching the job needs read permission on all three companion files
+and the `trajectories/*.pkl` files. The launcher performs an early readability
+check for the companion files and reports the exact path when permissions are
+insufficient.
+
+Archive startup is intentionally visible but not instantaneous. The current
+archive contains 23,326 segment files; each torchrun rank validates the shared
+catalog and builds its reference pool independently before reference/env
+sharding. The trainer emits `archive_load_start` and periodic
+`archive_load_progress` events before the normal `start` event. A cold full
+archive load can take roughly two minutes on network storage, so use the
+following bounded smoke first when checking a new node or environment:
+
+```bash
+SYMBOLS=AAPL MAX_ITERATIONS=1 SAVE_INTERVAL=1 NUM_ENVS=4 TINY=1 \
+ROLLOUT_STEPS=2 EPOCHS=1 NUM_MINIBATCHES=1 \
+bash scripts/train_finance_sonic_4gpu.sh
+```
+
+The launcher log is written under `/tmp/finance_launch_logs`; `tail -f` that
+file while waiting for the first rank events. A full run without `SYMBOLS`
+reads all indexed segments on every rank by design; GPU memory and utilization
+should also be checked before sharing devices with another training job.
+
+The launcher uses the current `python` only when it is suitable for the
+project. If `PYTHON_BIN` is unset, it probes the project and nearby virtual
+environments and prefers the first interpreter that can import all finance
+dependencies. Set `PYTHON_BIN` explicitly when the environment lives
+elsewhere, for example:
+
+```bash
+PYTHON_BIN=/path/to/finance-venv/bin/python \
+PYTHONPATH=/path/to/extra/site-packages \
+bash scripts/train_finance_sonic_4gpu.sh
+```
+
+The launcher also appends `FINANCE_PYTHONPATH` (or `LOCAL_PYTHON_DEPS`) to
+`PYTHONPATH` before probing. When neither is set, existing `.python_deps` and
+`/tmp/finance-sonic-deps` bundles are used automatically if present. This lets
+the common AeroStep torch environment reuse the finance-only packages without
+modifying that external virtualenv.
+
+For a new environment, install the project extras into that same interpreter:
+
+```bash
+/path/to/finance-venv/bin/python -m pip install -e '.[finance]'
+```
+
+On a real run the launcher checks `torch`, `numpy`, `omegaconf`, `tensordict`,
+`vector_quantize_pytorch`, and (when `LOGGER=tensorboard`)
+`torch.utils.tensorboard` before starting `torch.distributed.run`. Dry-runs
+skip the required-dependency preflight and training launch, while the candidate
+probe may still invoke lightweight interpreter import checks so the resolved
+Python path remains meaningful. TensorBoard is included in the `finance` extra;
+use `LOGGER=none` only when a dependency-free JSON-log run is intentional.
+
+TensorBoard follows the table-tennis runner's layout and rank ownership. A
+training run writes event files under `OUTPUT_DIR/tensorboard`, and only global
+rank 0 creates the writer. Scalars use the restored PPO iteration as their
+global step, so a resumed run continues at the checkpoint iteration instead of
+starting a second step-zero curve. The writer flushes every ten seconds and is
+explicitly flushed/closed at checkpoint and process boundaries.
+
+The main scalar groups are `Loss/` (`ppo_loss`, `value_loss`, `kin`, `cycle`),
+`Policy/` (`entropy`, `kl`, `grad_norm`, `learning_rate`), `Reward/` (monthly,
+path, change, volatility and contribution terms), and `Tracking/` (MSE, RMSE,
+direction accuracy and rolling diagnostics). These values are the already
+all-reduced metrics returned by `FinancialPPOTrainer`; TensorBoard does not
+introduce a second reward or loss calculation.
+
+For example, after the launcher prints the run directory, start the dashboard
+with:
+
+```bash
+tensorboard --logdir /tmp/finance_train_logs/<run>/tensorboard \
+  --host 0.0.0.0 --port 6006
+```
+
+The launcher prints the same command as `tensorboard_cmd`. Install the finance
+extras in the selected interpreter before a real TensorBoard run:
+
+```bash
+/path/to/finance-venv/bin/python -m pip install -e '.[finance]'
+```
+
+The launcher follows the generic operational contract of the table-tennis
+multi-GPU entrypoint. `NPROC_PER_NODE` is required to equal `NUM_GPUS`, and
+`NUM_ENVS` is the per-rank count, so the effective environment batch is
+`NUM_ENVS * NUM_GPUS`. The resolved `NCCL_*`, `TORCH_NCCL_ASYNC_ERROR_HANDLING`,
+thread, device, rendezvous, and process-count settings are exported to every
+`torchrun` worker and written to the launch log before the command starts.
+Defaults are conservative for the shared host and can be overridden through
+the environment when the machine has a known high-performance NCCL topology.
+
+For a detached run, set `AUTO_TMUX=1` (and optionally `TMUX_ATTACH=1`). The
+launcher writes a shell-quoted environment snapshot and wrapper under
+`TMUX_ENV_FILE`/`TMUX_RUN_FILE`, appends process output to `TMUX_LOG_FILE`, and
+keeps a failed tmux session open for inspection. The wrapper only re-enters
+this finance launcher with `AUTO_TMUX=0`; it does not add rank isolation or
+change archive, resume, reference/env sharding, gradient all-reduce, or
+rank-0 checkpoint behavior. Isaac, JAX, Omniverse, curriculum, and isolated
+launcher variables remain outside the finance contract.
+
+Archive validation and sequence construction currently run independently on each
+rank before the local slice is retained. The rollout/env ownership and gradient
+work are sharded, but startup CPU/RAM is therefore replicated; use symbol/date
+filters for bounded smoke runs when the full universe does not fit comfortably.
+
+For a resume without an explicit `TRAJECTORY_ROOT` (or companion override), the
+launcher omits source arguments and lets the checkpoint's saved canonical or
+archive recipe decide. This keeps canonical checkpoints resumable through the
+same command. `CURRICULUM_STAGES`, `JAX_RANK`, and related table-tennis-only
+environment variables have no meaning for the finance task and are ignored.
+
+Resume accepts both the native form and the table-tennis-style spelling:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NUM_GPUS=4 NUM_ENVS=1024 SEED=42 \
+bash scripts/train_finance_sonic_4gpu.sh \
+  --resume --checkpoint_path /path/to/checkpoint_040000.pt
+```
+
+On resume, architecture, sequence length, rollout length, epochs, and minibatch
+count are inherited unless explicitly supplied. `--iterations` remains the
+additional update count. Use `FINANCE_DRY_RUN=1` to inspect the fully resolved
+command without opening data, a checkpoint, or a distributed process group.
 
 Checkpoints contain actor/critic parameters, normalizers, optimizer state,
 iteration, model/PPO/environment contracts, and a reference-pool recipe. The
@@ -428,6 +581,58 @@ their original two-term reward, explicitly labeled by reward contract; scores
 under different contracts are not directly comparable.
 These metrics are not portfolio return, drawdown or unseen-data prediction
 accuracy: actual future descriptors are still Encoder inputs.
+
+### Sonic-Style Train-Set Playback Ledger
+
+To inspect whether a checkpoint can trace the reference trajectories in the same
+way as the L01 Sonic playback loop, request the optional detailed ledger:
+
+```bash
+python -m scripts.eval_finance_sonic \
+  --checkpoint PATH_TO_CHECKPOINT \
+  --output-dir /tmp/finance-playback-example \
+  --dump-trajectories --max-sequences 8 --plot-sequences 4 --device cpu
+```
+
+`--max-sequences` is optional; omit it to visit the complete checkpoint reference
+pool. `--dump-trajectories` requires `--output-dir` and streams rows directly to
+disk instead of retaining the complete ledger in memory. The command writes the
+usual aggregate files plus `trajectories.csv`.
+There is one row for every `(sequence_id, symbol, anchor_period, target_period,
+horizon)` pair. Prediction columns contain the normalized action mean and its
+raw log-return conversion; target columns contain the corresponding reference
+return, cumulative path, and the original future descriptor's cumulative value.
+Rows are tagged with `rollout_mode=privileged_train_playback`,
+`latent_source=oracle_future_encoder`, `encoder_input_mode=clean`, and
+`action_mode=deterministic_mean`.
+
+Each independent reference clip starts with an empty 32-step Decoder KV cache.
+At the next anchor the runner supplies the actual current state and actual clean
+future window from the same training clip; it never feeds the predicted path back
+as a market state. Kin, denoising noise, Gaussian sampling, and portfolio/PnL
+logic are not part of this diagnostic. Because the Encoder receives the true
+future window, this report measures privileged low-level reference tracking only;
+it is an upper-bound playback check, not a causal forecast or an unseen-data
+backtest.
+
+When a quick visual check is useful, add `--plot-sequences N` to the same
+command. Dump mode then also writes `trajectory_overview.png`, a deterministic
+1600x1000 RGB image containing three views: selected clips with predicted and
+target cumulative paths, an absolute cumulative-error heatmap, and a
+direction-agreement matrix based on monthly log-return signs. Only the first
+`N` sequence IDs are rendered;
+`trajectories.csv` still contains every evaluated row and remains the
+authoritative source for metrics and further analysis. The PNG is generated
+without Matplotlib, Pillow, or a display server, so it is suitable for batch
+evaluation environments. Within the fixed canvas, the path panel shows up to
+four clips and up to twelve representative anchors per clip. The heatmap and
+direction matrix use those same clips and show at most 25 and 36 representative
+anchors respectively.
+The image headings and summary record displayed/total counts, while the CSV
+retains every row. In `summary.json`, `plot_sequence_count`/`plot_anchor_count`
+describe the subset sent to the image and the corresponding `*_total` fields
+describe the complete evaluated playback. It is a diagnostic of privileged
+train-set tracking, not a causal forecast, portfolio simulation, or PnL result.
 
 `dataset_partition` is always `none`. Default evaluation is labeled
 `training_reference_pool`, not a held-out validation/test set. To select another
@@ -542,6 +747,37 @@ model.load_normalizers("data/us_socket/月线特征处理/sonic_reference_v1/nor
 # current_raw: [B,S,16], future_raw: [B,S,10,15]
 output = model(current_raw, future_raw)
 ```
+
+## Variable-Length Monthly Trajectories
+
+The cleaned canonical table is also organized as a Sonic-style trajectory
+archive by running:
+
+```bash
+python -m scripts.reconstruct_monthly_trajectories \
+  --canonical data/us_socket/月线清洗重构/monthly_canonical.csv \
+  --event-breaks data/us_socket/月线清洗重构/monthly_event_breaks.csv \
+  --output-dir data/us_socket/月线轨迹重构
+```
+
+`data/us_socket/月线轨迹重构/trajectories/` contains one mapping-wrapped
+`<safe_symbol>__segment_<id>.pkl` for each continuous valid monthly run. A
+segment is closed by an invalid raw/QFQ bar, a missing month, or an enabled
+confirmed event boundary. Short segments are retained for provenance but have
+zero complete six-month-warmup plus ten-month-horizon anchors. The PKL stores
+raw, forward-adjusted, and optional backward-adjusted OHLC fields, raw volume /
+amount / turnover, validity masks, dates, quality flags, and source row numbers.
+It deliberately does not store normalized 16-dimensional observations or a
+fake FPS field; those are derived by a finance loader so market context and
+normalization statistics remain current.
+
+`metadata.pkl`, `trajectory_index.csv`, `excluded_rows.csv`, and `manifest.json`
+record lengths, anchor counts, exclusions, event decisions, schema/dtype, and
+the canonical SHA256. Training can now use this archive directly with
+`--trajectory-root`; all companion files and every indexed PKL are checked before
+training. Unless `--canonical` is also supplied as an explicit market-context
+override, context is reconstructed from the archive itself. The resolved archive
+fingerprints and ordered fixed-sequence identity are stored in every checkpoint.
 
 Legacy support: `python -m scripts.prepare_legacy_features --monthly-features
 PATH --playback-samples PATH --output-dir NEW_DIR` bounds the earlier 6x16/10x16
@@ -744,3 +980,21 @@ Artifacts are under `/tmp/finance-legacy-resume-1U7nJu`: migrated checkpoints
 `schema2/checkpoint_000003.pt` and `schema3/checkpoint_000005.pt`, with reports in
 `schema2_eval` and `schema3_eval`. The implementation plan and current policy are
 in `superpowers/plans/2026-09-09-legacy-training-resume.md`.
+
+## Distributed Archive Verification on 2026-09-15
+
+A two-rank CPU/gloo `torch.distributed.run` test executes a complete PPO update
+against a synthetic trajectory archive. Its 44 fixed clips split 22/22, with
+four environments on each rank and eight globally. Both ranks report the same
+post-update parameter checksum. The output contains one `run_config.json` and
+one rank-0 checkpoint; the checkpoint records `gradient_reduction=all_reduce`,
+rank/world/reference/environment counts, finite model and optimizer state, and a
+Critic running-stat count pooled across both ranks.
+
+The production archive at `data/us_socket/月线轨迹重构` was also checked directly.
+An AAPL tiny-model run loaded and validated all 23,326 indexed archive files,
+built 86 two-anchor clips, completed one PPO update, and resumed from its sole
+checkpoint for a second update without canonical/source arguments. These are
+pipeline checks, not convergence or return evidence. The current host did not
+provide usable CUDA, so NCCL/GPU performance remains to be measured on the
+training machine.

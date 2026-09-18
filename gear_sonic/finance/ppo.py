@@ -1,4 +1,4 @@
-"""Single-process Sonic-style PPO, with detached KV context and live encoders."""
+"""Sonic-style PPO with optional explicit gradient synchronization."""
 
 from dataclasses import asdict, dataclass
 from copy import deepcopy
@@ -8,6 +8,7 @@ import warnings
 import torch
 
 from gear_sonic.finance.denoising import encoder_denoising_contract
+from gear_sonic.finance.distributed import DistributedContext
 from gear_sonic.finance.rewards import summarize_tracking_metrics, validate_reward_contract
 from gear_sonic.finance.resume import prepare_resume_checkpoint
 from gear_sonic.trl.utils.rl import compute_episode_attnmask
@@ -43,8 +44,14 @@ class PPOConfig:
             raise ValueError("desired KL must be positive or None")
 
 
-def compute_gae(rewards, values, dones, bootstrap, gamma, lam):
-    """Return GAE targets and sample-std normalized advantages, all [env, step]."""
+def _normalize_advantages(advantages):
+    scale = advantages.std() if advantages.numel() > 1 else advantages.new_zeros(())
+    return (advantages - advantages.mean()) / (scale + 1e-8)
+
+
+def compute_gae(rewards, values, dones, bootstrap, gamma, lam, *, normalize=True,
+                normalizer=None):
+    """Return GAE targets and optionally normalized advantages, all [env, step]."""
     returns = torch.zeros_like(values)
     advantage = torch.zeros_like(bootstrap)
     for step in reversed(range(rewards.shape[1])):
@@ -54,8 +61,8 @@ def compute_gae(rewards, values, dones, bootstrap, gamma, lam):
         advantage = delta + gamma * lam * alive * advantage
         returns[:, step] = advantage + values[:, step]
     advantages = returns - values
-    scale = advantages.std() if advantages.numel() > 1 else advantages.new_zeros(())
-    advantages = (advantages - advantages.mean()) / (scale + 1e-8)
+    if normalize:
+        advantages = normalizer(advantages) if normalizer is not None else _normalize_advantages(advantages)
     return returns, advantages
 
 
@@ -89,16 +96,20 @@ def clipped_ppo_losses(*, new_logprobs, old_logprobs, advantages, new_values,
 class FinancialPPOTrainer:
     """Bounded on-policy updates; resume restores weights but starts fresh clips.
 
-    This intentionally supports one process only. PPO follows the retained Sonic
-    trainer: AdamW at one actor/critic LR, T value targets plus one bootstrap,
-    complete environment streams as minibatches, and no additional world losses.
+    With a distributed context each rank owns independent environment streams;
+    gradients and stateful training statistics are synchronized explicitly so
+    the custom Actor/KV-cache API remains unchanged.
     """
 
     def __init__(self, actor, critic, env, config: PPOConfig | None = None, *,
-                 reference_config=None, reference_provenance="training_reference_pool"):
+                 reference_config=None, reference_provenance="training_reference_pool",
+                 distributed: DistributedContext | None = None,
+                 local_reference_count: int | None = None):
         self.config = config or PPOConfig()
-        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-            raise ValueError("FinancialPPOTrainer supports single-process training only")
+        self.distributed = distributed or DistributedContext()
+        if (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+                and not self.distributed.enabled):
+            raise ValueError("A distributed process group requires a DistributedContext")
         if self.config.num_minibatches > env.num_envs:
             raise ValueError("The minibatch count cannot exceed the number of environment streams")
         self.actor, self.critic, self.env = actor, critic, env
@@ -111,14 +122,23 @@ class FinancialPPOTrainer:
             validate_reference_config(reference_config)
             if reference_config["reward_contract"] != env.reward_contract:
                 raise ValueError("Reference reward contract differs from the training environment")
+            expected_count = (len(env._current_bank) if local_reference_count is None
+                              else local_reference_count)
             if (reference_config["sequence_length"] != env.sequence_length
                     or reference_config["horizon"] != env.horizon
-                    or reference_config["sequence_count"] != len(env._current_bank)):
+                    or expected_count != len(env._current_bank)
+                    or (local_reference_count is None
+                        and reference_config["sequence_count"] != len(env._current_bank))):
                 raise ValueError("Reference metadata does not match the training environment")
         if reference_provenance not in ("training_reference_pool", "legacy_reference_unverified"):
             raise ValueError("Unsupported reference provenance")
         self.reference_config = deepcopy(reference_config)
         self.reference_provenance = reference_provenance
+        self.local_reference_count = len(env._current_bank)
+        self.global_reference_count = (
+            reference_config["sequence_count"] if reference_config is not None
+            else self.local_reference_count
+        )
         self.parameters = [parameter for module in (actor, critic)
                            for parameter in module.parameters() if parameter.requires_grad]
         self.device = next(actor.parameters()).device
@@ -151,6 +171,31 @@ class FinancialPPOTrainer:
                     actual = torch.as_tensor(getattr(self.env, field), dtype=torch.float32)
                     if actual.ndim != 0 or not torch.isfinite(actual) or float(actual) != float(value):
                         raise ValueError(f"Environment config normalization {field} differs from actor statistics")
+
+    def _sync_critic_statistics(self):
+        self.distributed.sync_running_mean_std(self.critic.running_mean_std)
+
+    def _reduce_tracking_metrics(self, metrics):
+        """Gather equal local rollout tensors before producing global summaries."""
+        if not self.distributed.enabled:
+            return summarize_tracking_metrics(metrics)
+        gathered = {
+            name: self.distributed.gather(value)
+            for name, value in metrics.items()
+        }
+        return summarize_tracking_metrics(gathered)
+
+    def _reduce_update_metrics(self, metrics):
+        if not self.distributed.enabled:
+            return metrics
+        reduced = {}
+        for name, value in metrics.items():
+            if name == "updates":
+                # Every rank executes the same number of local minibatches.
+                reduced[name] = value
+            else:
+                reduced[name] = float(self.distributed.mean(value, device=self.device).item())
+        return reduced
 
     @torch.no_grad()
     def collect_rollout(self):
@@ -186,12 +231,17 @@ class FinancialPPOTrainer:
         obs = {key: torch.stack(value, dim=1) for key, value in observations.items()}
         critic_obs = torch.cat((obs["critic_obs"], self._obs["critic_obs"].unsqueeze(1)), dim=1)
         all_values = self.critic.evaluate({"critic_obs": critic_obs}).squeeze(-1)
+        self._sync_critic_statistics()
         batch = {key: torch.stack(value, dim=1) for key, value in stored.items()}
         batch.update(obs=obs, prefix=prefix, values=all_values[:, :-1], bootstrap=all_values[:, -1])
         batch["tracking_metrics"] = {key: torch.stack(values, dim=1) for key, values in diagnostics.items()}
-        batch["returns"], batch["advantages"] = compute_gae(
+        batch["returns"], raw_advantages = compute_gae(
             batch["rewards"], batch["values"], batch["dones"], batch["bootstrap"],
-            self.config.gamma, self.config.lam,
+            self.config.gamma, self.config.lam, normalize=False,
+        )
+        batch["advantages"] = (
+            self.distributed.standardize(raw_advantages)
+            if self.distributed.enabled else _normalize_advantages(raw_advantages)
         )
         return batch
 
@@ -241,6 +291,7 @@ class FinancialPPOTrainer:
                 finally:
                     if rms is not None:
                         rms.train()
+                self._sync_critic_statistics()
                 losses = clipped_ppo_losses(
                     new_logprobs=self.actor.get_actions_log_prob(batch["actions"][indices]),
                     old_logprobs=batch["logprobs"][indices], advantages=batch["advantages"][indices],
@@ -257,9 +308,12 @@ class FinancialPPOTrainer:
                 losses["loss"] = total_loss
                 if not all(bool(torch.isfinite(value).all()) for value in losses.values()):
                     raise FloatingPointError("Non-finite financial PPO loss")
-                self._adjust_learning_rate(float(losses["kl"]))
+                global_kl = (self.distributed.mean(losses["kl"], device=self.device)
+                             if self.distributed.enabled else losses["kl"])
+                self._adjust_learning_rate(float(global_kl))
                 self.optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
+                self.distributed.sync_gradients(self.parameters)
                 losses["grad_norm"] = torch.nn.utils.clip_grad_norm_(
                     self.parameters, self.config.max_grad_norm, error_if_nonfinite=True,
                 )
@@ -269,14 +323,17 @@ class FinancialPPOTrainer:
                     totals[name] = totals.get(name, 0.0) + float(value.detach()) * weight
                 updates += 1
         totals.update(updates=updates, learning_rate=self.learning_rate)
-        return totals
+        return self._reduce_update_metrics(totals)
 
     def train_iteration(self):
         batch = self.collect_rollout()
         metrics = self.update(batch)
-        metrics.update(summarize_tracking_metrics(batch["tracking_metrics"]))
+        metrics.update(self._reduce_tracking_metrics(batch["tracking_metrics"]))
         self.iteration += 1
-        metrics.update(iteration=self.iteration, terminal_count=int(batch["dones"].sum()))
+        terminal_count = int(batch["dones"].sum())
+        if self.distributed.enabled:
+            terminal_count = int(self.distributed.sum(terminal_count, device=self.device).item())
+        metrics.update(iteration=self.iteration, terminal_count=terminal_count)
         return metrics
 
     def _environment_config(self):
@@ -289,6 +346,8 @@ class FinancialPPOTrainer:
 
     def save_checkpoint(self, path):
         """Write a new checkpoint exclusively; never overwrite an existing path."""
+        if self.distributed.enabled and not self.distributed.is_main_process:
+            raise RuntimeError("Only rank 0 may publish a finance PPO checkpoint")
         validate_reward_contract(self.env.reward_contract)
         if self.env.encoder_denoising is not True:
             raise ValueError("Financial PPO checkpoints require encoder denoising")
@@ -306,6 +365,11 @@ class FinancialPPOTrainer:
             "actor": self.actor.state_dict(), "critic": self.critic.state_dict(),
             "optimizer": self.optimizer.state_dict(), "iteration": self.iteration,
             "learning_rate": self.learning_rate,
+            "distributed": self.distributed.metadata(
+                reference_count_global=self.global_reference_count,
+                reference_count_local=self.local_reference_count,
+                env_count_local=self.env.num_envs,
+            ),
         }
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
